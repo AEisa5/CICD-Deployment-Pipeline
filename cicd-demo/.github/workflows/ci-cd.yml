@@ -1,0 +1,186 @@
+name: CI/CD Pipeline
+
+# ---------------------------------------------------------------
+# Trigger: runs automatically on every push / pull request
+# ---------------------------------------------------------------
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:        # allows running it manually from the Actions tab
+
+# Cancel an older run of the same branch when a newer push arrives
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: the pipeline only needs to read the repo
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # =============================================================
+  # Stage 1: Static analysis (linter)
+  # =============================================================
+  lint:
+    name: "1. Lint (flake8)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pull code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run flake8
+        run: flake8 . --count --statistics | tee flake8-report.txt
+
+      - name: Publish lint metrics
+        if: always()
+        run: |
+          {
+            echo "### Lint results"
+            echo '```'
+            tail -n 20 flake8-report.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # =============================================================
+  # Stage 2: Unit tests (only if lint passed)
+  # =============================================================
+  test:
+    name: "2. Unit tests (py${{ matrix.python-version }})"
+    needs: lint
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - name: Pull code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run pytest with coverage
+        run: |
+          pytest \
+            --junitxml=junit-${{ matrix.python-version }}.xml \
+            --cov=app --cov-report=term --cov-report=xml \
+            --cov-fail-under=80 | tee pytest-output.txt
+
+      - name: Publish test metrics
+        if: always()
+        run: |
+          {
+            echo "### Test results - Python ${{ matrix.python-version }}"
+            echo '```'
+            tail -n 15 pytest-output.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports-py${{ matrix.python-version }}
+          path: |
+            junit-${{ matrix.python-version }}.xml
+            coverage.xml
+
+  # =============================================================
+  # Stage 3: Build / package the application
+  # =============================================================
+  build:
+    name: "3. Build package"
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pull code
+        uses: actions/checkout@v4
+
+      - name: Create release archive
+        run: |
+          mkdir -p dist
+          tar -czf "dist/app-${GITHUB_SHA::7}.tar.gz" app/
+          ls -lh dist/
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-package
+          path: dist/
+
+  # =============================================================
+  # Stage 4: Deploy (only on push to main)
+  # =============================================================
+  deploy:
+    name: "4. Deploy"
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production     # enables approval rules + deployment history
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-package
+          path: dist/
+
+      - name: Deploy (simulated)
+        run: |
+          echo "Deploying $(ls dist/) to production..."
+          # Replace this step with a real deployment, e.g.:
+          #   scp / rsync to a server, docker push, aws s3 sync, kubectl apply...
+          sleep 2
+          echo "Deployment finished"
+
+  # =============================================================
+  # Stage 5: Final status board (always runs)
+  # =============================================================
+  report:
+    name: "5. Pipeline status board"
+    needs: [lint, test, build, deploy]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write status board
+        run: |
+          {
+            echo "## Pipeline status board"
+            echo ""
+            echo "| Stage | Result |"
+            echo "|-------|--------|"
+            echo "| Lint | ${{ needs.lint.result }} |"
+            echo "| Test | ${{ needs.test.result }} |"
+            echo "| Build | ${{ needs.build.result }} |"
+            echo "| Deploy | ${{ needs.deploy.result }} |"
+            echo ""
+            echo "- **Commit:** \`${GITHUB_SHA::7}\`"
+            echo "- **Branch:** \`${GITHUB_REF_NAME}\`"
+            echo "- **Triggered by:** ${GITHUB_ACTOR} (${GITHUB_EVENT_NAME})"
+            echo "- **Run:** #${GITHUB_RUN_NUMBER}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail if any required stage failed
+        if: contains(needs.*.result, 'failure')
+        run: exit 1
